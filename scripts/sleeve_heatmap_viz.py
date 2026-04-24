@@ -9,18 +9,25 @@ Pipeline:
   3. Build strip grids  →  left_display_plot (A-E, mirrored) / right_display (F-J)
   4. Load calibration borders  (pre-fitted warp control points)
   5. Precompute RBF inverse-warp maps  (done once, reused every frame)
-  6. Animate: apply_warp per frame  →  FuncAnimation  →  HTML
+  6. Animate: apply_warp per frame  →  FuncAnimation  →  HTML or live window
 
 Usage
 -----
+    # In a notebook:
     from sleeve_heatmap_viz import run
-    run(data_dir="../data", assets_dir="../assets")
+    display(run(data_dir="../data", assets_dir="../assets"))
 
-Or run standalone:
+    # As a script (opens live window):
     python sleeve_heatmap_viz.py
 """
 
 from __future__ import annotations
+
+import matplotlib
+# Must be set before pyplot is imported.
+# TkAgg opens a live interactive window when run as a script.
+# Notebooks override this automatically — no effect there.
+matplotlib.use("TkAgg")
 
 from pathlib import Path
 import json
@@ -29,9 +36,11 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Slider, Button
 from IPython.display import HTML
 from PIL import Image
 from scipy.interpolate import RBFInterpolator
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -181,16 +190,16 @@ def build_strip_grids(
     strip_depth = 13
     n_frames = rms_frames.shape[0]
 
-    strip_grid    = np.full((n_frames, strip_depth, 10), np.nan, dtype=np.float32)
+    strip_grid     = np.full((n_frames, strip_depth, 10), np.nan, dtype=np.float32)
     electrode_grid = np.full((strip_depth, 10), -1, dtype=np.int32)
 
     for s_idx, ch_idx in enumerate(STRIP_CHANNELS):
         if ch_idx.size == 13:
-            strip_grid[:, :, s_idx]    = rms_frames[:, ch_idx]
-            electrode_grid[:, s_idx]   = ch_idx + 1          # 1-based IDs
+            strip_grid[:, :, s_idx]   = rms_frames[:, ch_idx]
+            electrode_grid[:, s_idx]  = ch_idx + 1          # 1-based IDs
         elif ch_idx.size == 12:
-            strip_grid[:, 1:, s_idx]   = rms_frames[:, ch_idx]
-            electrode_grid[1:, s_idx]  = ch_idx + 1
+            strip_grid[:, 1:, s_idx]  = rms_frames[:, ch_idx]
+            electrode_grid[1:, s_idx] = ch_idx + 1
         else:
             raise RuntimeError(f"Unexpected strip length for {STRIP_NAMES[s_idx]}: {ch_idx.size}")
 
@@ -207,8 +216,8 @@ def build_strip_grids(
     right_elec_t  = right_elec.T
 
     # Mirror A-E both horizontally and vertically so it faces the right way
-    left_display_plot       = np.flip(left_display, axis=(1, 2))
-    left_elec_display_plot  = np.flip(left_elec_t,  axis=(0, 1))
+    left_display_plot      = np.flip(left_display, axis=(1, 2))
+    left_elec_display_plot = np.flip(left_elec_t,  axis=(0, 1))
 
     return left_display_plot, right_display, left_elec_display_plot, right_elec_t
 
@@ -242,6 +251,7 @@ def make_source_border_points(nx: int = 7, ny: int = 2) -> tuple[np.ndarray, lis
     Parameters
     ----------
     nx, ny : number of points along x-edge and y-edge (corners shared).
+             Must match the values used during calibration.
 
     Returns
     -------
@@ -251,10 +261,10 @@ def make_source_border_points(nx: int = 7, ny: int = 2) -> tuple[np.ndarray, lis
     xs = np.linspace(0.0, 12.0, nx, dtype=np.float32)
     ys = np.linspace(0.0,  4.0, ny, dtype=np.float32)
 
-    top    = np.column_stack([xs,                              np.full_like(xs, ys[0])])
-    right  = np.column_stack([np.full((ny - 1,), xs[-1],  dtype=np.float32), ys[1:]])
-    bottom = np.column_stack([xs[-2::-1],                      np.full((nx - 1,), ys[-1], dtype=np.float32)])
-    left   = np.column_stack([np.full((ny - 2,), xs[0],   dtype=np.float32), ys[-2:0:-1]])
+    top    = np.column_stack([xs,                                            np.full_like(xs, ys[0])])
+    right  = np.column_stack([np.full((ny - 1,), xs[-1], dtype=np.float32), ys[1:]])
+    bottom = np.column_stack([xs[-2::-1],                                    np.full((nx - 1,), ys[-1], dtype=np.float32)])
+    left   = np.column_stack([np.full((ny - 2,), xs[0],  dtype=np.float32), ys[-2:0:-1]])
 
     src_border = np.vstack([top, right, bottom, left]).astype(np.float32)
     corner_idx = [0, nx - 1, nx + (ny - 2), 2 * nx + ny - 3]   # TL TR BR BL
@@ -403,11 +413,11 @@ def annotate_warp_corners(
     names         : corner label prefixes, default ["TL","TR","BR","BL"]
     """
     for k, ci in enumerate(corner_idx):
-        px, py   = dst_border[ci]
-        r, c     = CORNER_MAP_POSITIONS[k]
-        eid      = int(electrode_map[r, c])
-        txt      = f"{names[k]}: E{eid}" if eid > 0 else f"{names[k]}: NA"
-        ha, va   = CORNER_HA_VA[k]
+        px, py = dst_border[ci]
+        r, c   = CORNER_MAP_POSITIONS[k]
+        eid    = int(electrode_map[r, c])
+        txt    = f"{names[k]}: E{eid}" if eid > 0 else f"{names[k]}: NA"
+        ha, va = CORNER_HA_VA[k]
         ax.text(
             px, py, txt,
             ha=ha, va=va,
@@ -438,27 +448,30 @@ def build_animation(
     vmin: float,
     vmax: float,
     interval: int = 60,
+    close_fig: bool = True,
 ) -> FuncAnimation:
     """
     Build and return a FuncAnimation that renders both forearm views
-    side-by-side.
+    stacked vertically.
 
     Static elements (corner labels, titles) are created once.
     The update() closure only calls set_data() — no artists are recreated.
 
     Parameters
     ----------
-    interval : ms between frames (lower = faster playback)
+    interval  : ms between frames (lower = faster playback)
+    close_fig : True  → plt.close() after building  (notebook mode, avoids double render)
+                False → leave figure open            (script mode, needed for plt.show())
 
     Returns
     -------
-    ani : FuncAnimation  (caller is responsible for display / saving)
+    ani : FuncAnimation
     """
     fig, axs = plt.subplots(2, 1, figsize=(8, 5))
     axs[0].set_title("Inner (A–E)")
     axs[1].set_title("Outer (F–J)")
 
-    # Initial frame displayed before animation starts
+    # Initial frame — background only, animation fills in from frame 0
     im_inner = axs[0].imshow(bg_inner.copy())
     im_outer = axs[1].imshow(bg_outer.copy())
 
@@ -474,8 +487,8 @@ def build_animation(
 
     def update(i: int):
         """Update image data for frame i — no new artists created."""
-        out_inner = apply_warp(left_display_plot[i],  warp_inner, bg_inner, cmap, vmin, vmax)
-        out_outer = apply_warp(right_display[i],       warp_outer, bg_outer, cmap, vmin, vmax)
+        out_inner = apply_warp(left_display_plot[i], warp_inner, bg_inner, cmap, vmin, vmax)
+        out_outer = apply_warp(right_display[i],      warp_outer, bg_outer, cmap, vmin, vmax)
         im_inner.set_data(out_inner)
         im_outer.set_data(out_outer)
         title.set_text(f"Frame {i}  (sample {int(rms_starts[i])})")
@@ -487,46 +500,51 @@ def build_animation(
         interval=interval,
         blit=False,
     )
-    plt.close(fig)
+
+    if close_fig:
+        plt.close(fig)   # prevents double-render in notebooks
+
     return ani
 
 
 # ---------------------------------------------------------------------------
-# 9. Top-level entry point
+# 9. Top-level pipeline
 # ---------------------------------------------------------------------------
 
 def run(
-    data_dir:   str | Path = "../data",
-    assets_dir: str | Path = "../assets",
-    rms_win:    int = 50,
-    rms_hop:    int = 10,
-    edge_nx:    int = 7,
-    edge_ny:    int = 2,
-    interval:   int = 60,
-) -> HTML:
+    data_dir:    str | Path = "../data",
+    assets_dir:  str | Path = "../assets",
+    rms_win:     int = 50,
+    rms_hop:     int = 10,
+    edge_nx:     int = 7,
+    edge_ny:     int = 2,
+    interval:    int = 60,
+    return_html: bool = True,
+) -> HTML | FuncAnimation:
     """
-    Full pipeline from raw data files to an in-notebook HTML animation.
+    Full pipeline from raw data files to animation.
 
     Parameters
     ----------
-    data_dir   : directory containing .npy / .json / calibration files
-    assets_dir : directory containing forearm JPEG templates
-    rms_win    : sliding-RMS window length (samples)
-    rms_hop    : sliding-RMS hop size (samples)
-    edge_nx    : border control points along the long axis  (must match calibration)
-    edge_ny    : border control points along the short axis (must match calibration)
-    interval   : animation frame interval in ms
+    data_dir    : directory containing .npy / .json / calibration files
+    assets_dir  : directory containing forearm JPEG templates
+    rms_win     : sliding-RMS window length (samples)
+    rms_hop     : sliding-RMS hop size (samples)
+    edge_nx     : border control points along the long axis  (must match calibration)
+    edge_ny     : border control points along the short axis (must match calibration)
+    interval    : animation frame interval in ms
+    return_html : True  → returns IPython HTML object  (notebook mode)
+                  False → returns raw FuncAnimation     (script / interactive mode)
 
     Returns
     -------
-    HTML object ready for IPython.display.display()
+    HTML object (notebook) or FuncAnimation (script)
     """
     # -- Load ----------------------------------------------------------------
-    data       = load_data(data_dir)
-    bg_inner, bg_outer = load_templates(assets_dir)
+    data                               = load_data(data_dir)
+    bg_inner, bg_outer                 = load_templates(assets_dir)
     dst_border_inner, dst_border_outer = load_calibration(data_dir)
-
-    signal = data["signal"]
+    signal                             = data["signal"]
 
     # -- RMS -----------------------------------------------------------------
     rms_frames, rms_starts = sliding_rms(signal, win=rms_win, hop=rms_hop)
@@ -541,44 +559,49 @@ def run(
 
     vmin, vmax = compute_color_limits(left_display_plot, right_display)
 
-    # Colormap: viridis with transparent NaN
     cmap = plt.cm.viridis.copy()
     cmap.set_bad((0, 0, 0, 0))
 
     # -- Border source points (must match what was used during calibration) --
     src_border, corner_idx = make_source_border_points(nx=edge_nx, ny=edge_ny)
 
-    # -- Precompute warps (slow, once) ---------------------------------------
+    # -- Precompute warps (slow step, runs once) -----------------------------
     warp_inner = precompute_warp(dst_border_inner, src_border, bg_inner)
     warp_outer = precompute_warp(dst_border_outer, src_border, bg_outer)
 
     # -- Build animation -----------------------------------------------------
     ani = build_animation(
-        left_display_plot       = left_display_plot,
-        right_display           = right_display,
-        left_electrode_display_plot  = left_electrode_display_plot,
-        right_electrode_display      = right_electrode_display,
-        rms_starts              = rms_starts,
-        warp_inner              = warp_inner,
-        warp_outer              = warp_outer,
-        dst_border_inner        = dst_border_inner,
-        dst_border_outer        = dst_border_outer,
-        corner_idx              = corner_idx,
-        bg_inner                = bg_inner,
-        bg_outer                = bg_outer,
-        cmap                    = cmap,
-        vmin                    = vmin,
-        vmax                    = vmax,
-        interval                = interval,
+        left_display_plot           = left_display_plot,
+        right_display               = right_display,
+        left_electrode_display_plot = left_electrode_display_plot,
+        right_electrode_display     = right_electrode_display,
+        rms_starts                  = rms_starts,
+        warp_inner                  = warp_inner,
+        warp_outer                  = warp_outer,
+        dst_border_inner            = dst_border_inner,
+        dst_border_outer            = dst_border_outer,
+        corner_idx                  = corner_idx,
+        bg_inner                    = bg_inner,
+        bg_outer                    = bg_outer,
+        cmap                        = cmap,
+        vmin                        = vmin,
+        vmax                        = vmax,
+        interval                    = interval,
+        close_fig                   = return_html,   # keep fig open for interactive mode
     )
 
-    return HTML(ani.to_jshtml())
+    if return_html:
+        return HTML(ani.to_jshtml())
+    return ani
 
 
 # ---------------------------------------------------------------------------
-# Script entry point
+# Script entry point  —  opens a live interactive window
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from IPython.display import display
-    display(run())
+    print("Loading data and precomputing warps...")
+    ani = run(return_html=False)
+
+    print("Rendering — close the window to exit.")
+    plt.show()   # blocks until window is closed
