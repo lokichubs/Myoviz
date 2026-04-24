@@ -1,0 +1,19 @@
+{
+  "dataset_name": "synthetic_hdemg_sleeve",
+  "frames": 900,
+  "channels": 128,
+  "fs_hz": 1000,
+  "seed": 42,
+  "layout": "26x5 default sleeve ring map",
+  "map_shape": [
+    26,
+    5
+  ],
+  "valid_count": 128,
+  "invalid_count": 2,
+  "files": {
+    "signal": "synthetic_signal.npy",
+    "ring_map": "ring_map.npy",
+    "valid_mask": "valid_mask.npy"
+  }
+}
